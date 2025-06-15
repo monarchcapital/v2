@@ -6,17 +6,18 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import timedelta, date, datetime
 import os
-# Removed yfinance import as it's only for news fetching
-# import yfinance as yf # Import yfinance for news fetching
 
-# Import functions from utils.py
+# Import functions from utils.py and config.py
+import config
 from utils import (
     download_data, create_features,
     train_models_pipeline, generate_predictions_pipeline,
-    calculate_pivot_points,
-    # No direct save/load prediction here, as watchlist just displays next-day predictions
-    # but the underlying models still use the save_prediction from utils
+    calculate_pivot_points, save_prediction,
+    is_morning_star, is_evening_star, get_short_term_trend,
+    parse_int_list # Imported parse_int_list from utils
 )
+
+st.set_page_config(page_title="Monarch: Stock Price Predictor", layout="wide")
 
 st.header("📋 My Watchlist")
 st.markdown("""
@@ -89,98 +90,73 @@ if start_date_watchlist >= end_date_watchlist:
     st.sidebar.error("Watchlist Training Start Date must be before Watchlist Training End Date.")
     st.stop()
 
+# --- Hyperparameter Tuning Option ---
+watchlist_perform_tuning = st.sidebar.checkbox("Perform Hyperparameter Tuning (Watchlist)", value=False, help="May increase processing time for each watchlist item but can improve accuracy.")
+
+# --- Confidence Interval Parameter for Watchlist ---
+enable_confidence_interval_watchlist = st.sidebar.checkbox("Enable Prediction Confidence Intervals (Watchlist)", value=False, help="Display prediction intervals based on model residuals for watchlist items.")
+confidence_level_pct_watchlist = 90
+if enable_confidence_interval_watchlist:
+    confidence_level_pct_watchlist = st.sidebar.slider("Confidence Level (%) (Watchlist)", min_value=70, max_value=99, value=90, step=1, help="The confidence level for the prediction interval.")
+
+
+st.sidebar.markdown("**Technical Indicator Parameters (for Watchlist predictions)**")
+st.sidebar.info("These should ideally match settings on the Home page for consistent results.")
+
+# Dictionary to store selected indicator parameters for watchlist
+selected_indicator_params_watchlist = {}
+
+# Function to provide error callback for Streamlit display in sidebar
+def sidebar_error_callback_watchlist(message):
+    st.sidebar.error(message)
+
+# Loop through TECHNICAL_INDICATORS_DEFAULTS to create UI for each
+for indicator_name, (default_value, default_enabled) in config.TECHNICAL_INDICATORS_DEFAULTS.items():
+    if indicator_name == 'PARSAR_ACCELERATION' or indicator_name == 'PARSAR_MAX_ACCELERATION':
+        # These are handled inside the PARSAR_ENABLED block
+        continue
+    
+    # Use a unique key for each checkbox to avoid Streamlit warnings
+    checkbox_key = f"enable_{indicator_name.lower()}_wl" # Added _wl for uniqueness
+    param_key_prefix = indicator_name.replace('_', ' ')
+
+    if indicator_name.endswith('_ENABLED'): # For indicators like OBV_ENABLED, PARSAR_ENABLED
+        enabled = st.sidebar.checkbox(f"Enable {param_key_prefix.replace('_enabled', '')} (WL):", value=default_enabled, key=checkbox_key)
+        selected_indicator_params_watchlist[indicator_name] = enabled
+        if indicator_name == 'PARSAR_ENABLED' and enabled:
+            # Show Parabolic SAR specific parameters only if enabled
+            selected_indicator_params_watchlist['PARSAR_ACCELERATION'] = st.sidebar.number_input(f"  Parabolic SAR Acceleration (WL):", min_value=0.01, max_value=0.5, value=config.TECHNICAL_INDICATORS_DEFAULTS['PARSAR_ACCELERATION'][0], step=0.01, key=f"input_parsar_accel_wl")
+            selected_indicator_params_watchlist['PARSAR_MAX_ACCELERATION'] = st.sidebar.number_input(f"  Parabolic SAR Max Acceleration (WL):", min_value=0.01, max_value=0.5, value=config.TECHNICAL_INDICATORS_DEFAULTS['PARSAR_MAX_ACCELERATION'][0], step=0.01, key=f"input_parsar_max_accel_wl")
+
+    else: # For indicators with windows/values
+        enabled = st.sidebar.checkbox(f"Enable {param_key_prefix} (WL):", value=default_enabled, key=checkbox_key)
+        
+        if enabled:
+            if isinstance(default_value, list):
+                # List inputs (Lag, MA, STD windows)
+                parsed_list = parse_int_list(
+                    st.sidebar.text_input(f"  {param_key_prefix.replace('_', ' ')} (comma-separated days, e.g., {','.join(map(str, default_value))}):", 
+                                       value=", ".join(map(str, default_value)), key=f"input_{indicator_name.lower()}_wl"),
+                    default_value,
+                    sidebar_error_callback_watchlist # Pass the error callback
+                )
+                selected_indicator_params_watchlist[indicator_name] = parsed_list if parsed_list else None # Store None if empty after parsing
+            elif isinstance(default_value, (int, float)):
+                # Single value inputs (RSI, MACD, BB, ATR, Stoch, CCI, ROC, ADX, CMF)
+                if indicator_name == 'BB_STD_DEV':
+                    selected_indicator_params_watchlist[indicator_name] = st.sidebar.number_input(f"  {param_key_prefix.replace('_', ' ')} Multiplier (WL):", min_value=0.1, value=default_value, step=0.1, key=f"input_{indicator_name.lower()}_wl")
+                else:
+                    selected_indicator_params_watchlist[indicator_name] = st.sidebar.number_input(f"  {param_key_prefix.replace('_', ' ')} (WL):", min_value=1, value=default_value, step=1, key=f"input_{indicator_name.lower()}_wl")
+            else:
+                selected_indicator_params_watchlist[indicator_name] = None # Should not happen with current config, but for safety
+        else:
+            selected_indicator_params_watchlist[indicator_name] = None # Indicator is disabled
+
+
 # Calculate the number of days for display
 training_duration_days = (end_date_watchlist - start_date_watchlist).days
 st.sidebar.info(f"Models on the watchlist are currently trained using data from **{start_date_watchlist.strftime('%Y-%m-%d')}** to **{end_date_watchlist.strftime('%Y-%m-%d')}** ({training_duration_days} days). Please set these dates to match your 'Training Period' on the Home page for consistent predictions.")
 
-
-# --- Candlestick Pattern Detection Functions (Simplified) ---
-def is_morning_star(df_recent):
-    # Requires at least 3 candles:
-    # 1. Long bearish candle
-    # 2. Small-bodied candle (could be bullish or bearish, typically a doji or spinning top)
-    # 3. Long bullish candle that closes well into the body of the first candle
-    if len(df_recent) < 3:
-        return False
-
-    c1, c2, c3 = df_recent.iloc[-3], df_recent.iloc[-2], df_recent.iloc[-1]
-
-    # Conditions for Morning Star (simplified)
-    # C1: Long bearish (Close < Open, large body)
-    cond1 = c1['Close'] < c1['Open'] and (c1['Open'] - c1['Close']) / c1['Open'] > 0.015
-
-    # C2: Small body (Close close to Open)
-    cond2 = abs(c2['Close'] - c2['Open']) / c2['Open'] < 0.005 # Small body
-
-    # C3: Long bullish (Close > Open, large body)
-    cond3 = c3['Close'] > c3['Open'] and (c3['Close'] - c3['Open']) / c3['Open'] > 0.015
-
-    # C3 opens above or near C2 close, and closes into C1's body
-    cond4 = c3['Open'] > c2['Close'] and c3['Close'] > (c1['Open'] + c1['Close']) / 2
-
-    return cond1 and cond2 and cond3 and cond4
-
-def is_evening_star(df_recent):
-    # Requires at least 3 candles:
-    # 1. Long bullish candle
-    # 2. Small-bodied candle (could be bullish or bearish, typically a doji or spinning top)
-    # 3. Long bearish candle that closes well into the body of the first candle
-    if len(df_recent) < 3:
-        return False
-
-    c1, c2, c3 = df_recent.iloc[-3], df_recent.iloc[-2], df_recent.iloc[-1]
-
-    # Conditions for Evening Star (simplified)
-    # C1: Long bullish (Close > Open, large body)
-    cond1 = c1['Close'] > c1['Open'] and (c1['Close'] - c1['Open']) / c1['Open'] > 0.015
-
-    # C2: Small body (Close close to Open)
-    cond2 = abs(c2['Close'] - c2['Open']) / c2['Open'] < 0.005 # Small body
-
-    # C3: Long bearish (Close < Open, large body)
-    cond3 = c3['Close'] < c3['Open'] and (c3['Open'] - c3['Close']) / c3['Open'] > 0.015
-
-    # C3 opens below or near C2 close, and closes into C1's body
-    cond4 = c3['Open'] < c2['Close'] and c3['Close'] < (c1['Open'] + c1['Close']) / 2
-
-    return cond1 and cond2 and cond3 and cond4
-
-def get_short_term_trend(df_features, short_ma_window=5, long_ma_window=20):
-    if len(df_features) < max(short_ma_window, long_ma_window):
-        return "Not Enough Data"
-
-    # Recalculate MAs on the fly if needed for just the latest data point
-    current_short_ma = df_features['Close'].iloc[-short_ma_window:].mean()
-    current_long_ma = df_features['Close'].iloc[-long_ma_window:].mean()
-
-    if current_short_ma > current_long_ma:
-        return "Uptrend (Short-term)"
-    elif current_short_ma < current_long_ma:
-        return "Downtrend (Short-term)"
-    else:
-        return "Neutral (Short-term)"
-
-# --- Styling function for DataFrame ---
-def highlight_end_color(row):
-    # Create a list of empty strings for default styles
-    styles = [''] * len(row)
-
-    # Get the index of the 'End_Color' column
-    try:
-        end_color_idx = row.index.get_loc('End_Color')
-    except KeyError:
-        # If 'End_Color' column is not found (e.g., initial empty df), return empty styles
-        return styles
-
-    # Apply color based on the value in 'End_Color'
-    if row['End_Color'] == 'Green (Up)':
-        styles[end_color_idx] = 'background-color: #d4edda;' # Light green
-    elif row['End_Color'] == 'Red (Down)':
-        styles[end_color_idx] = 'background-color: #f8d7da;' # Light red
-    elif row['End_Color'] == 'Flat (Neutral)':
-        styles[end_color_idx] = 'background-color: #fff3cd;' # Light yellow/neutral
-
-    return styles
 
 # --- Function to calculate Heikin Ashi candles ---
 def calculate_heikin_ashi(df):
@@ -240,42 +216,6 @@ def create_small_chart(df, ticker_symbol, chart_type='heikin_ashi'):
     )
     return fig
 
-# --- Removed fetch_stock_news function ---
-# def fetch_stock_news(ticker_symbol, limit=10):
-#     try:
-#         ticker_obj = yf.Ticker(ticker_symbol)
-#         news = ticker_obj.news
-
-#         if not news: # Check if news list is empty
-#             print(f"DEBUG: No news data returned from yfinance for {ticker_symbol}.") # Debug print
-#             return []
-
-#         # Sort news by publish time (newest to oldest) and limit
-#         # Ensure 'providerPublishTime' exists before using it for sorting
-#         news_list = sorted([item for item in news if 'providerPublishTime' in item],
-#                            key=lambda x: x['providerPublishTime'], reverse=True)[:limit]
-
-#         if not news_list: # If filtering removed all news (e.g., missing providerPublishTime)
-#             print(f"DEBUG: News filtered out due to missing 'providerPublishTime' for {ticker_symbol}.") # Debug print
-#             return []
-
-#         formatted_news = []
-#         for item in news_list:
-#             title = item.get('title', 'No Title')
-#             link = item.get('link', '#')
-#             # Convert Unix timestamp to datetime, then format
-#             publish_time_unix = item.get('providerPublishTime')
-#             publish_date = datetime.fromtimestamp(publish_time_unix).strftime('%Y-%m-%d %H:%M') if publish_time_unix else 'N/A'
-#             formatted_news.append({
-#                 'title': title,
-#                 'link': link,
-#                 'date': publish_date
-#             })
-#         return formatted_news
-#     except Exception as e:
-#         print(f"DEBUG: Error fetching news for {ticker_symbol}: {e}") # Log to console
-#         return []
-
 # --- Watchlist Display and Prediction ---
 st.markdown("---")
 st.subheader("Next-Day Forecasts for Your Watchlist")
@@ -285,30 +225,14 @@ if not st.session_state.watchlist:
 else:
     watchlist_results = []
 
-    # Define common model choices for the watchlist
-    # Tuning is set to False for faster processing on the watchlist page
-    models_for_watchlist = ['XGBoost', 'Random Forest', 'Linear Regression']
-    watchlist_perform_tuning = False
-
-    # These should be consistent with Home.py for feature generation
-    lag_features_list = [1, 2, 3, 5, 10]
-    ma_windows_list = [10, 20, 50]
-    std_windows_list = [10, 20]
-    rsi_window = 14
-    macd_short_window = 12
-    macd_long_window = 26
-    macd_signal_window = 9
-    bb_window = 20
-    bb_std_dev = 2.0
-    atr_window = 14
-    stoch_window = 14
-    stoch_smooth_window = 3
+    # Define common model choices for the watchlist (now all models from config)
+    models_for_watchlist = config.MODEL_CHOICES # Use all models from config
 
     # Define a simple logger for watchlist page to avoid cluttering main log
     def watchlist_log(message):
         pass # In this context, we don't need detailed logging for each watchlist item
 
-    progress_text = "Processing watchlist... This may take a moment."
+    progress_text = "Processing watchlist..."
     my_bar = st.progress(0, text=progress_text)
 
     # Prepare a list to hold data for the main predictions table
@@ -325,42 +249,50 @@ else:
             item_data['Status'] = f"No data for {ticker_item}"
             # Initialize all model-specific prediction columns to N/A
             for model_name in models_for_watchlist:
-                item_data[f'Close ({model_name})'] = 'N/A'
-                item_data[f'Open ({model_name})'] = 'N/A'
-                item_data[f'High ({model_name})'] = 'N/A'
-                item_data[f'Low ({model_name})'] = 'N/A'
-                item_data[f'Volatility ({model_name})'] = 'N/A'
-            item_data['End_Color'] = 'N/A'
+                item_data[f'Close ({model_name})'] = np.nan # Store as NaN
+                item_data[f'Open ({model_name})'] = np.nan # Store as NaN
+                item_data[f'Close Lower ({model_name})'] = np.nan
+                item_data[f'Close Upper ({model_name})'] = np.nan
+                item_data[f'Open Lower ({model_name})'] = np.nan
+                item_data[f'Open Upper ({model_name})'] = np.nan
             item_data['Detected_Pattern'] = 'N/A'
-            item_data['Last Actual Close'] = 'N/A'
-            item_data['R1 (Resistance)'] = 'N/A'
-            item_data['S1 (Support)'] = 'N/A'
+            item_data['Last Actual Close'] = np.nan # Store as NaN
+            item_data['R1 (Resistance)'] = np.nan # Store as NaN
+            item_data['S1 (Support)'] = np.nan # Store as NaN
             item_data['chart_fig'] = None # Store None for chart
-            # Removed item_data['news'] = []
-            watchlist_results.append(item_data)
             predictions_table_data.append(item_data.copy()) # Add to table data
             continue
 
-        df_features = create_features(df_raw.copy(), lag_features_list, ma_windows_list, std_windows_list, rsi_window, macd_short_window, macd_long_window, macd_signal_window, bb_window, bb_std_dev, atr_window, stoch_window, stoch_smooth_window)
+        # Pass selected_indicator_params_watchlist dictionary to create_features
+        df_features = create_features(df_raw.copy(), selected_indicator_params_watchlist)
 
-        # Ensure enough data for feature calculation after creation
-        min_data_required = max(lag_features_list + ma_windows_list + std_windows_list + [rsi_window, macd_long_window, bb_window, atr_window, stoch_window, stoch_smooth_window]) + 1
-        if len(df_features) < min_data_required:
-            item_data['Status'] = f"Insufficient data for features ({len(df_features)} rows)"
+        # Ensure enough data for feature calculation (based on max window from ALL configured indicators)
+        min_data_required_wl = 0
+        for param_name, (default_value, default_enabled) in config.TECHNICAL_INDICATORS_DEFAULTS.items():
+            if param_name in selected_indicator_params_watchlist and selected_indicator_params_watchlist[param_name] is not None:
+                param_value = selected_indicator_params_watchlist[param_name]
+                if isinstance(param_value, list) and param_value:
+                    min_data_required_wl = max(min_data_required_wl, max(param_value))
+                elif isinstance(param_value, (int, float)):
+                    min_data_required_wl = max(min_data_required_wl, int(param_value))
+
+        if min_data_required_wl < 50: # Fallback to a reasonable minimum
+            min_data_required_wl = 50 
+        
+        if len(df_features) < min_data_required_wl:
+            item_data['Status'] = f"Insufficient data for features ({len(df_features)} rows). Need at least {min_data_required_wl} rows for enabled indicators."
             for model_name in models_for_watchlist:
-                item_data[f'Close ({model_name})'] = 'N/A'
-                item_data[f'Open ({model_name})'] = 'N/A'
-                item_data[f'High ({model_name})'] = 'N/A'
-                item_data[f'Low ({model_name})'] = 'N/A'
-                item_data[f'Volatility ({model_name})'] = 'N/A'
-            item_data['End_Color'] = 'N/A'
+                item_data[f'Close ({model_name})'] = np.nan
+                item_data[f'Open ({model_name})'] = np.nan
+                item_data[f'Close Lower ({model_name})'] = np.nan
+                item_data[f'Close Upper ({model_name})'] = np.nan
+                item_data[f'Open Lower ({model_name})'] = np.nan
+                item_data[f'Open Upper ({model_name})'] = np.nan
             item_data['Detected_Pattern'] = 'N/A'
-            item_data['Last Actual Close'] = 'N/A'
-            item_data['R1 (Resistance)'] = 'N/A'
-            item_data['S1 (Support)'] = 'N/A'
+            item_data['Last Actual Close'] = np.nan
+            item_data['R1 (Resistance)'] = np.nan
+            item_data['S1 (Support)'] = np.nan
             item_data['chart_fig'] = None # Store None for chart
-            # Removed item_data['news'] = []
-            watchlist_results.append(item_data)
             predictions_table_data.append(item_data.copy()) # Add to table data
             continue
 
@@ -370,97 +302,131 @@ else:
         if df_train_period_watchlist.empty:
             item_data['Status'] = "No data in watchlist training range."
             for model_name in models_for_watchlist:
-                item_data[f'Close ({model_name})'] = 'N/A (No Train Data)'
-                item_data[f'Open ({model_name})'] = 'N/A (No Train Data)'
-                item_data[f'High ({model_name})'] = 'N/A (No Train Data)'
-                item_data[f'Low ({model_name})'] = 'N/A (No Train Data)'
-                item_data[f'Volatility ({model_name})'] = 'N/A (No Train Data)'
-            item_data['End_Color'] = 'N/A'
+                item_data[f'Close ({model_name})'] = np.nan
+                item_data[f'Open ({model_name})'] = np.nan
+                item_data[f'Close Lower ({model_name})'] = np.nan
+                item_data[f'Close Upper ({model_name})'] = np.nan
+                item_data[f'Open Lower ({model_name})'] = np.nan
+                item_data[f'Open Upper ({model_name})'] = np.nan
             item_data['Detected_Pattern'] = 'N/A'
-            item_data['Last Actual Close'] = 'N/A'
-            item_data['R1 (Resistance)'] = 'N/A'
-            item_data['S1 (Support)'] = 'N/A'
+            item_data['Last Actual Close'] = np.nan
+            item_data['R1 (Resistance)'] = np.nan
+            item_data['S1 (Support)'] = np.nan
             item_data['chart_fig'] = None
-            # Removed item_data['news'] = []
-            watchlist_results.append(item_data)
             predictions_table_data.append(item_data.copy())
             continue
 
 
         # Get last trading day's features to predict the next day
         last_day_features = df_features.tail(1).copy()
+        last_known_date_item = df_features['Date'].iloc[-1]
+        next_trading_day_item = last_known_date_item + timedelta(days=1)
+        while next_trading_day_item.weekday() >= 5: next_trading_day_item += timedelta(days=1)
+
 
         # Calculate Pivot Points based on the most recent full day's data
         pivot_points = calculate_pivot_points(df_raw.tail(1)) # Use raw data for PP calculation as it needs true HLC
 
         # Add Pivot Points to item_data
-        item_data['R1 (Resistance)'] = f"{pivot_points['R1']:.2f}" if pd.notna(pivot_points['R1']) else "N/A"
-        item_data['S1 (Support)'] = f"{pivot_points['S1']:.2f}" if pd.notna(pivot_points['S1']) else "N/A"
+        item_data['R1 (Resistance)'] = pivot_points['R1'] # Store as number
+        item_data['S1 (Support)'] = pivot_points['S1'] # Store as number
         item_data['Status'] = 'OK'
 
-        # Determine End_Color for the next day's close price
+        # Determine next day's close price for general info
         last_actual_close = df_raw['Close'].iloc[-1] if len(df_raw) > 0 else np.nan
-        item_data['Last Actual Close'] = f"{last_actual_close:.2f}" if pd.notna(last_actual_close) else "N/A"
-        predicted_close_main_model = np.nan # Will store main model's close for color comparison
-
+        item_data['Last Actual Close'] = last_actual_close # Store as number
+        
         # Train and predict with each selected model
         for model_name in models_for_watchlist:
             # Train models for this ticker using the user-defined training period
-            # Use df_train_period_watchlist instead of tail(watchlist_training_days_param)
-
-            if df_train_period_watchlist.empty: # Double check if df_train_period_watchlist became empty after filtering
-                 item_data[f'Close ({model_name})'] = 'N/A (No Train Data)'
-                 item_data[f'Open ({model_name})'] = 'N/A (No Train Data)'
-                 item_data[f'High ({model_name})'] = 'N/A (No Train Data)'
-                 item_data[f'Low ({model_name})'] = 'N/A (No Train Data)'
-                 item_data[f'Volatility ({model_name})'] = 'N/A (No Train Data)'
+            if df_train_period_watchlist.empty:
+                 item_data[f'Close ({model_name})'] = np.nan
+                 item_data[f'Open ({model_name})'] = np.nan
+                 item_data[f'Close Lower ({model_name})'] = np.nan
+                 item_data[f'Close Upper ({model_name})'] = np.nan
+                 item_data[f'Open Lower ({model_name})'] = np.nan
+                 item_data[f'Open Upper ({model_name})'] = np.nan
                  item_data['Status'] = "Partial Data"
                  continue
 
-
-            trained_models_for_item = train_models_pipeline(
+            trained_models_for_item, _ = train_models_pipeline(
                 df_train_period_watchlist.copy(), # Use the date-filtered training data
                 model_name,
-                watchlist_perform_tuning,
-                std_windows_list,
-                watchlist_log
+                watchlist_perform_tuning, # Pass the tuning preference
+                watchlist_log,
+                selected_indicator_params_watchlist # Pass the indicator parameters
             )
 
-            if trained_models_for_item and all(mi.get('model') is not None for mi in trained_models_for_item.values() if mi):
-                next_day_preds_dict = generate_predictions_pipeline(last_day_features.copy(), trained_models_for_item, watchlist_log)
+            # Define the targets to predict for watchlist (Close and Open)
+            targets_to_predict = {}
+            if 'Close' in trained_models_for_item and trained_models_for_item['Close'].get('model'):
+                targets_to_predict['Close'] = trained_models_for_item['Close']
+            if 'Open' in trained_models_for_item and trained_models_for_item['Open'].get('model'):
+                targets_to_predict['Open'] = trained_models_for_item['Open']
 
-                pred_close = next_day_preds_dict.get('Close', {}).get('Predicted Close', pd.Series()).iloc[-1] if not next_day_preds_dict.get('Close', {}).empty else np.nan
-                pred_open = next_day_preds_dict.get('Open', {}).get('Predicted Open', pd.Series()).iloc[-1] if not next_day_preds_dict.get('Open', {}).empty else np.nan
-                pred_high = next_day_preds_dict.get('High', {}).get('Predicted High', pd.Series()).iloc[-1] if not next_day_preds_dict.get('High', {}).empty else np.nan
-                pred_low = next_day_preds_dict.get('Low', {}).get('Predicted Low', pd.Series()).iloc[-1] if not next_day_preds_dict.get('Low', {}).empty else np.nan
-                pred_vol = next_day_preds_dict.get('Volatility', {}).get('Predicted Volatility', pd.Series()).iloc[-1] if not next_day_preds_dict.get('Volatility', {}).empty else np.nan
 
-                item_data[f'Close ({model_name})'] = f"{pred_close:.2f}" if pd.notna(pred_close) else "N/A"
-                item_data[f'Open ({model_name})'] = f"{pred_open:.2f}" if pd.notna(pred_open) else "N/A"
-                item_data[f'High ({model_name})'] = f"{pred_high:.2f}" if pd.notna(pred_high) else "N/A"
-                item_data[f'Low ({model_name})'] = f"{pred_low:.2f}" if pd.notna(pred_low) else "N/A"
-                item_data[f'Volatility ({model_name})'] = f"{pred_vol:.4f}" if pd.notna(pred_vol) else "N/A"
+            if targets_to_predict: # If any target model was successfully trained
+                next_day_preds_dict = generate_predictions_pipeline(last_day_features.copy(), targets_to_predict, watchlist_log, confidence_level_pct_watchlist if enable_confidence_interval_watchlist else None)
 
-                if model_name == models_for_watchlist[0] and pd.notna(pred_close): # Use the first model's close for color
-                    predicted_close_main_model = pred_close
-            else:
-                item_data[f'Close ({model_name})'] = 'N/A (Model Failed)'
-                item_data[f'Open ({model_name})'] = 'N/A (Model Failed)'
-                item_data[f'High ({model_name})'] = 'N/A (Model Failed)'
-                item_data[f'Low ({model_name})'] = 'N/A (Model Failed)'
-                item_data[f'Volatility ({model_name})'] = 'N/A (Model Failed)'
+                # Get Close predictions
+                pred_close = np.nan
+                pred_close_lower = np.nan
+                pred_close_upper = np.nan
+                if 'Close' in next_day_preds_dict and not next_day_preds_dict['Close'].empty:
+                    pred_close = next_day_preds_dict['Close']['Predicted Close'].iloc[-1]
+                    # Access bounds only if they exist in the DataFrame
+                    if f'Predicted Close Lower' in next_day_preds_dict['Close'].columns:
+                        pred_close_lower = next_day_preds_dict['Close']['Predicted Close Lower'].iloc[-1]
+                    if f'Predicted Close Upper' in next_day_preds_dict['Close'].columns:
+                        pred_close_upper = next_day_preds_dict['Close']['Predicted Close Upper'].iloc[-1]
+
+
+                # Get Open predictions
+                pred_open = np.nan
+                pred_open_lower = np.nan
+                pred_open_upper = np.nan
+                if 'Open' in next_day_preds_dict and not next_day_preds_dict['Open'].empty:
+                    pred_open = next_day_preds_dict['Open']['Predicted Open'].iloc[-1]
+                    # Access bounds only if they exist in the DataFrame
+                    if f'Predicted Open Lower' in next_day_preds_dict['Open'].columns:
+                        pred_open_lower = next_day_preds_dict['Open']['Predicted Open Lower'].iloc[-1]
+                    if f'Predicted Open Upper' in next_day_preds_dict['Open'].columns:
+                        pred_open_upper = next_day_preds_dict['Open']['Predicted Open Upper'].iloc[-1]
+                
+                item_data[f'Close ({model_name})'] = pred_close
+                item_data[f'Close Lower ({model_name})'] = pred_close_lower
+                item_data[f'Close Upper ({model_name})'] = pred_close_upper
+                item_data[f'Open ({model_name})'] = pred_open
+                item_data[f'Open Lower ({model_name})'] = pred_open_lower
+                item_data[f'Open Upper ({model_name})'] = pred_open_upper
+
+                # Save predictions
+                for target_type_key, pred_val, actual_val, lower_b, upper_b in [
+                    ('Close', pred_close, last_actual_close, pred_close_lower, pred_close_upper),
+                    ('Open', pred_open, df_raw['Open'].iloc[-1] if len(df_raw)>0 else np.nan, pred_open_lower, pred_open_upper) # Use actual open for last day
+                ]:
+                    if pd.notna(pred_val):
+                        save_prediction(
+                            ticker_item, 
+                            next_trading_day_item, 
+                            pred_val, 
+                            actual_val, 
+                            model_name, 
+                            datetime.now(), 
+                            end_date_watchlist, 
+                            predicted_type=target_type_key,
+                            predicted_lower_bound=lower_b,
+                            predicted_upper_bound=upper_b
+                        )
+            else: # If no target model was successfully trained for this item/model
+                item_data[f'Close ({model_name})'] = np.nan
+                item_data[f'Open ({model_name})'] = np.nan
+                item_data[f'Close Lower ({model_name})'] = np.nan
+                item_data[f'Close Upper ({model_name})'] = np.nan
+                item_data[f'Open Lower ({model_name})'] = np.nan
+                item_data[f'Open Upper ({model_name})'] = np.nan
                 item_data['Status'] = "Partial Data"
 
-        # Determine End_Color based on the first model's predicted close vs last actual close
-        if pd.notna(predicted_close_main_model) and pd.notna(last_actual_close):
-            if predicted_close_main_model > last_actual_close:
-                item_data['End_Color'] = 'Green (Up)'
-            elif predicted_close_main_model < last_actual_close:
-                item_data['End_Color'] = 'Red (Down)'
-            else:
-                item_data['End_Color'] = 'Flat (Neutral)'
-        else:
-            item_data['End_Color'] = 'N/A'
 
         # Detect Patterns
         pattern_found = []
@@ -472,9 +438,9 @@ else:
             elif is_evening_star(df_for_patterns):
                 pattern_found.append("Evening Star")
 
-        # Add short-term trend
-        if len(df_features) >= max(5, 20):
-            pattern_found.append(get_short_term_trend(df_features))
+        # Add short-term trend (using first two MA windows from configured watchlist MAs)
+        # Pass the full indicator_params dictionary to get_short_term_trend
+        pattern_found.append(get_short_term_trend(df_features, selected_indicator_params_watchlist))
 
         item_data['Detected_Pattern'] = ", ".join(pattern_found) if pattern_found else "No specific pattern"
 
@@ -485,10 +451,6 @@ else:
         else:
             item_data['chart_fig'] = None
 
-        # Removed news fetching:
-        # item_data['news'] = fetch_stock_news(ticker_item)
-
-        watchlist_results.append(item_data)
         predictions_table_data.append(item_data.copy()) # Add to table data
 
     my_bar.empty() # Clear the progress bar
@@ -497,52 +459,69 @@ else:
         df_predictions_table = pd.DataFrame(predictions_table_data)
 
         # Dynamically create display columns for the main predictions table
-        display_cols_predictions_table = ['Ticker', 'Status', 'Last Actual Close', 'End_Color', 'Detected_Pattern']
-        for model_name in models_for_watchlist:
+        display_cols_predictions_table = ['Ticker', 'Status', 'Last Actual Close', 'Detected_Pattern'] 
+        for model_name in models_for_watchlist: # Loop through ALL models
             display_cols_predictions_table.extend([
                 f'Close ({model_name})',
-                f'Open ({model_name})',
-                f'High ({model_name})',
-                f'Low ({model_name})',
-                f'Volatility ({model_name})'
             ])
+            if enable_confidence_interval_watchlist:
+                 display_cols_predictions_table.extend([
+                    f'Close Lower ({model_name})',
+                    f'Close Upper ({model_name})'
+                 ])
+            display_cols_predictions_table.extend([
+                f'Open ({model_name})' # Only display Close and Open
+            ])
+            if enable_confidence_interval_watchlist:
+                 display_cols_predictions_table.extend([
+                    f'Open Lower ({model_name})',
+                    f'Open Upper ({model_name})'
+                 ])
         display_cols_predictions_table.extend(['R1 (Resistance)', 'S1 (Support)'])
 
         # Filter columns to only include those actually generated for the table
         df_predictions_table = df_predictions_table[[col for col in display_cols_predictions_table if col in df_predictions_table.columns]]
 
-        st.dataframe(df_predictions_table.style.apply(highlight_end_color, axis=1), hide_index=True)
+        # Define formatting dictionary for numerical columns
+        format_dict = {
+            "Last Actual Close": "{:.2f}",
+            "R1 (Resistance)": "{:.2f}",
+            "S1 (Support)": "{:.2f}",
+        }
+        for model_name in models_for_watchlist:
+            format_dict[f"Close ({model_name})"] = "{:.2f}"
+            format_dict[f"Open ({model_name})"] = "{:.2f}"
+            if enable_confidence_interval_watchlist:
+                format_dict[f"Close Lower ({model_name})"] = "{:.2f}"
+                format_dict[f"Close Upper ({model_name})"] = "{:.2f}"
+                format_dict[f"Open Lower ({model_name})"] = "{:.2f}"
+                format_dict[f"Open Upper ({model_name})"] = "{:.2f}"
+
+        st.dataframe(df_predictions_table.style.format(format_dict), hide_index=True)
+
 
         st.markdown("---")
         st.subheader("Charts for Watchlist Stocks") # Updated subheader
 
         # Display charts for each ticker (news display loop removed)
-        for item in watchlist_results:
+        for item in predictions_table_data: # Use predictions_table_data which includes chart_fig
             st.markdown(f"#### {item['Ticker']}")
 
             # Use st.expander for the chart
             with st.expander(f"View Chart for {item['Ticker']}", expanded=False):
-                if item['chart_fig']:
+                if item.get('chart_fig'): # Use .get() for safety
                     st.plotly_chart(item['chart_fig'], use_container_width=True)
                 else:
                     st.info(f"Chart not available for {item['Ticker']}.")
 
-            # Removed news display
-            # st.markdown("##### Latest News:")
-            # if item['news']:
-            #     for news_item in item['news']:
-            #         st.markdown(f"- **{news_item['date']}**: [{news_item['title']}]({news_item['link']})")
-            # else:
-            #     st.info(f"No recent news found for {item['Ticker']}.")
             st.markdown("---") # Separator between tickers
 
         st.info("""
         **About Watchlist Predictions & Patterns:**
-        * **End Color:** Indicates if the *predicted* next-day close price (from the first model in the list) is higher (Green), lower (Red), or same (Flat) than the *last actual* close price. This cell is now color-coded for quick visual cues.
         * **Last Actual Close:** The actual closing price from the most recent trading day.
-        * **Detected Pattern:** Currently identifies "Morning Star" and "Evening Star" candlestick patterns (3-day patterns) and a "Short-term Trend" based on 5-day vs 20-day Moving Averages.
+        * **Detected Pattern:** Currently identifies "Morning Star" and "Evening Star" candlestick patterns (3-day patterns) and a "Short-term Trend" based on moving average crossovers.
         * **Limitations on Complex Patterns:** Chart patterns like "ascending triangles" or "head and shoulders" require advanced geometric analysis of multiple price swings, trendline validation, and often volume confirmation. Implementing robust and accurate detection for such complex patterns typically requires specialized technical analysis libraries (e.g., `TA-Lib`) or highly sophisticated custom algorithms, which are beyond the scope of this simplified implementation. The current patterns are based on straightforward candlestick definitions and moving average crossovers.
-        * Predictions on the watchlist page use a fixed set of common models (XGBoost, Random Forest, Linear Regression) without hyperparameter tuning for faster processing.
+        * Predictions on the watchlist page now use **all available models** (as configured in `config.py`). Hyperparameter tuning can be enabled in the sidebar.
         """)
     else:
         st.info("No forecast data available for your watchlist items.")
