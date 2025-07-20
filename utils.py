@@ -283,6 +283,22 @@ def create_features(df, indicator_params):
         exp2 = df_copy['Close'].ewm(span=indicator_params['MACD_LONG_WINDOW'], adjust=False).mean()
         df_copy['MACD'] = exp1 - exp2
         df_copy['MACD_Signal'] = df_copy['MACD'].ewm(span=indicator_params['MACD_SIGNAL_WINDOW'], adjust=False).mean()
+    if 'ADX_WINDOW' in indicator_params and indicator_params.get('ADX_WINDOW'):
+        adx_window = int(indicator_params['ADX_WINDOW'])
+        high_diff = df_copy['High'].diff()
+        low_diff = df_copy['Low'].diff()
+        plus_dm = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
+        minus_dm = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
+        tr1 = df_copy['High'] - df_copy['Low']
+        tr2 = np.abs(df_copy['High'] - df_copy['Close'].shift())
+        tr3 = np.abs(df_copy['Low'] - df_copy['Close'].shift())
+        tr = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+        atr = tr.ewm(span=adx_window, adjust=False).mean()
+        plus_di = 100 * (pd.Series(plus_dm).ewm(span=adx_window, adjust=False).mean() / atr)
+        minus_di = 100 * (pd.Series(minus_dm).ewm(span=adx_window, adjust=False).mean() / atr)
+        dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
+        df_copy['ADX'] = dx.ewm(span=adx_window, adjust=False).mean()
+
 
     # Momentum Indicators
     if 'RSI_WINDOW' in indicator_params and indicator_params.get('RSI_WINDOW'):
@@ -292,11 +308,38 @@ def create_features(df, indicator_params):
         loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
         rs = gain / loss
         df_copy['RSI'] = 100 - (100 / (1 + rs))
+    if 'ROC_WINDOW' in indicator_params and indicator_params.get('ROC_WINDOW'):
+        for window in indicator_params['ROC_WINDOW']:
+            df_copy[f'ROC_{window}'] = df_copy['Close'].pct_change(periods=window) * 100
+    stoch_params = ['STOCHASTIC_K_WINDOW', 'STOCHASTIC_D_WINDOW']
+    if all(p in indicator_params and indicator_params.get(p) for p in stoch_params):
+        k_window = int(indicator_params['STOCHASTIC_K_WINDOW'])
+        d_window = int(indicator_params['STOCHASTIC_D_WINDOW'])
+        low_min = df_copy['Low'].rolling(window=k_window).min()
+        high_max = df_copy['High'].rolling(window=k_window).max()
+        df_copy['%K'] = 100 * ((df_copy['Close'] - low_min) / (high_max - low_min))
+        df_copy['%D'] = df_copy['%K'].rolling(window=d_window).mean()
+    if 'WILLIAMS_R_WINDOW' in indicator_params and indicator_params.get('WILLIAMS_R_WINDOW'):
+        wr_window = int(indicator_params['WILLIAMS_R_WINDOW'])
+        high_max_wr = df_copy['High'].rolling(window=wr_window).max()
+        low_min_wr = df_copy['Low'].rolling(window=wr_window).min()
+        df_copy['Williams_%R'] = -100 * ((high_max_wr - df_copy['Close']) / (high_max_wr - low_min_wr))
+
+
+    # Volume Indicators
+    if 'OBV' in indicator_params and indicator_params.get('OBV'):
+        obv = np.where(df_copy['Close'] > df_copy['Close'].shift(1), df_copy['Volume'],
+              np.where(df_copy['Close'] < df_copy['Close'].shift(1), -df_copy['Volume'], 0)).cumsum()
+        df_copy['OBV'] = obv
+    if 'CMF_WINDOW' in indicator_params and indicator_params.get('CMF_WINDOW'):
+        cmf_window = int(indicator_params['CMF_WINDOW'])
+        mfm = ((df_copy['Close'] - df_copy['Low']) - (df_copy['High'] - df_copy['Close'])) / (df_copy['High'] - df_copy['Low'])
+        mfm = mfm.fillna(0)
+        mfv = mfm * df_copy['Volume']
+        df_copy['CMF'] = mfv.rolling(window=cmf_window).sum() / df_copy['Volume'].rolling(window=cmf_window).sum()
+
 
     # Volatility Indicators
-    if 'STD_WINDOWS' in indicator_params and indicator_params.get('STD_WINDOWS'):
-        for window in indicator_params['STD_WINDOWS']:
-            df_copy[f'STD_{window}'] = df_copy['Close'].rolling(window=window).std()
     if 'BB_WINDOW' in indicator_params and 'BB_STD_DEV' in indicator_params:
         bb_window = int(indicator_params['BB_WINDOW'])
         ma = df_copy['Close'].rolling(window=bb_window).mean()
@@ -310,9 +353,6 @@ def create_features(df, indicator_params):
         low_close = np.abs(df_copy['Low'] - df_copy['Close'].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df_copy['ATR'] = tr.ewm(span=atr_window, adjust=False).mean()
-        
-    # --- NOTE: ICHIMOKU and FIBONACCI are placeholders in config and not implemented here ---
-    # To implement them, their specific calculations would be added in this section.
 
     # Final cleanup
     df_copy.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -594,4 +634,3 @@ def generate_iterative_forecast(raw_data, trained_models, ticker_symbol, n_futur
         history_for_iteration = pd.concat([history_for_iteration, pd.DataFrame([new_row])], ignore_index=True)
         
     return pd.DataFrame(future_predictions_list) if future_predictions_list else pd.DataFrame()
-

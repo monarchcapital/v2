@@ -9,19 +9,23 @@ TECHNICAL_INDICATORS_DEFAULTS = {
     'MACD_SHORT_WINDOW': (12, True),
     'MACD_LONG_WINDOW': (26, True),
     'MACD_SIGNAL_WINDOW': (9, True),
+    'ADX_WINDOW': (14, True),
 
     # Momentum Indicators
     'RSI_WINDOW': (14, True),
+    'ROC_WINDOW': ([12, 24], True),
+    'STOCHASTIC_K_WINDOW': (14, True),
+    'STOCHASTIC_D_WINDOW': (3, True),
+    'WILLIAMS_R_WINDOW': (14, True),
+
+    # Volume Indicators
+    'OBV': (True, True),
+    'CMF_WINDOW': (20, True),
 
     # Volatility Indicators
-    'STD_WINDOWS': ([20], True),
     'BB_WINDOW': (20, True),
     'BB_STD_DEV': (2.0, True),
-    'ATR_WINDOW': (14, True),
-
-    # Other/Complex Indicators (Restored)
-    'ICHIMOKU': (True, True),
-    'FIBONACCI_RETRACEMENT': (True, True)
+    'ATR_WINDOW': (14, True)
 }
 
 # Defines the fundamental metrics available for feature selection.
