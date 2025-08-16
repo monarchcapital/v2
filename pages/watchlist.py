@@ -1,285 +1,252 @@
-# pages/watchlist.py
+# pages/watchlist.py - A Streamlit page for a stock watchlist with multiple tabs.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta, date, datetime
+from datetime import date, timedelta
+import warnings
 import os
-import time
-import plotly.express as px
+import json
 
-import config
-from utils import (
-    download_data, create_features, train_models_pipeline,
-    generate_predictions_pipeline, add_market_data_features,
-    make_ensemble_prediction,
-    parse_int_list,
-    add_fundamental_features
-)
+# --- Import Core Functions from other modules ---
+from data import fetch_stock_data, add_technical_indicators, add_macro_indicators, add_fundamental_indicators
+from utils import preprocess_data, create_sequences, calculate_metrics
+from model import build_lstm_model, build_transformer_model, build_hybrid_model, train_model, predict_prices
 
-st.set_page_config(page_title="Monarch: My Watchlist", layout="wide")
+# Suppress warnings to keep the UI clean
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
-st.header("📋 My Watchlist")
-st.markdown("Add stocks to your watchlist for quick, next-day forecasts. This page allows for sophisticated analysis using individual or ensemble models with confidence intervals.")
+# --- File-Based Persistence Functions ---
+WATCHLIST_FILE = "watchlists.txt"
 
-# --- Watchlist Management in Sidebar---
-WATCHLIST_FILE = "monarch_watchlist.txt"
+def load_watchlists_from_file():
+    """Loads watchlists from a text file."""
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, 'r') as f:
+                data = json.load(f)
+                for key in ['Watchlist 1', 'Watchlist 2', 'Watchlist 3']:
+                    data[key] = set(data.get(key, []))
+                return data
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+    return {'Watchlist 1': set(), 'Watchlist 2': set(), 'Watchlist 3': set()}
 
-def load_watchlist():
-    """Loads the watchlist from a local text file."""
-    if not os.path.exists(WATCHLIST_FILE): return []
-    with open(WATCHLIST_FILE, "r") as f:
-        return sorted(list(set([line.strip().upper() for line in f if line.strip()])))
+def save_watchlists_to_file(watchlists):
+    """Saves watchlists to a text file."""
+    try:
+        with open(WATCHLIST_FILE, 'w') as f:
+            serializable_watchlists = {k: list(v) for k, v in watchlists.items()}
+            json.dump(serializable_watchlists, f)
+    except IOError as e:
+        st.error(f"Error saving watchlists to file: {e}")
 
-def save_watchlist(tickers):
-    """Saves the watchlist to a local text file."""
-    with open(WATCHLIST_FILE, "w") as f:
-        for ticker in sorted(list(set(tickers))):
-            f.write(f"{ticker}\n")
+# --- Page Configuration ---
+st.set_page_config(page_title="Stock Watchlists", page_icon="📈", layout="wide")
 
-if 'watchlist' not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
+# --- Initialize Session State ---
+if 'watchlists' not in st.session_state:
+    st.session_state.watchlists = load_watchlists_from_file()
 
-with st.sidebar:
-    st.header("🛠️ Watchlist Configuration")
+# --- Sidebar Configuration ---
+st.sidebar.header("⚙️ Watchlist Prediction Parameters")
+today = date.today()
+start_date_input = st.sidebar.date_input("Start Date", value=today - timedelta(days=5*365), key="wl_start_date")
+end_date_input = st.sidebar.date_input("End Date", value=today, key="wl_end_date")
+
+st.sidebar.subheader("Model Parameters")
+training_window_size_input = st.sidebar.slider("Time steps (look-back days)", 5, 60, 30, key="wl_ts")
+test_set_split_ratio_input = st.sidebar.slider("Test set split ratio", 0.10, 0.50, 0.20, 0.05, key="wl_split")
+prediction_horizon_input = st.sidebar.slider("Prediction Horizon (days)", 1, 30, 5, key="wl_horizon")
+model_type_input = st.sidebar.radio("Select Model Type", ('LSTM', 'Transformer', 'Hybrid (LSTM + Transformer)'), index=2, key="wl_model_type")
+
+st.sidebar.subheader("Optional Features")
+all_tech_indicators = ["SMA_20", "SMA_50", "RSI", "MACD", "OBV", "Bollinger Bands", "ATR", "MFI"]
+selected_tech_indicators = st.sidebar.multiselect("Technical Indicators", all_tech_indicators, default=["SMA_20", "RSI", "MACD"], key="wl_tech")
+
+all_macro_indicators = ['S&P 500', 'Crude Oil', 'DXY', '10-Year Yield', 'VIX', 'Nifty 50']
+selected_macro_indicators = st.sidebar.multiselect("Macroeconomic Indicators", all_macro_indicators, default=[], key="wl_macro")
+
+all_fundamental_indicators = ['Total Revenue', 'Net Income', 'EBITDA', 'Total Assets', 'Total Liabilities', 'Operating Cash Flow', 'Capital Expenditure']
+selected_fundamental_indicators = st.sidebar.multiselect("Fundamental Indicators", all_fundamental_indicators, default=[], key="wl_fundamental")
+
+st.sidebar.subheader("Hyperparameter & Ensemble Mode")
+use_ensemble = st.sidebar.checkbox("Use Ensemble of Models", value=True, key="wl_ensemble")
+if use_ensemble:
+    num_ensemble_models = st.sidebar.slider("Ensemble Size", 2, 10, 5, key="wl_ensemble_size")
+else:
+    num_ensemble_models = 1
+
+manual_params = {}
+st.sidebar.subheader("Manual Hyperparameters")
+epochs = st.sidebar.number_input("Epochs (Manual)", 1, 100, 30, key="wl_epochs")
+batch_size = st.sidebar.number_input("Batch Size (Manual)", 1, 256, 32, key="wl_batch_size")
+learning_rate = st.sidebar.number_input("Learning Rate (Manual)", 0.0001, 0.1, 0.001, format="%.4f", key="wl_lr")
+
+if model_type_input == 'LSTM':
+    manual_params['num_lstm_layers'] = st.sidebar.slider("LSTM Layers", 1, 3, 2, key="wl_lstm_layers")
+    manual_params['lstm_units_1'] = st.sidebar.slider("LSTM Layer 1 Units", 32, 256, 100, 32, key="wl_lstm_u1")
+    manual_params['dropout_1'] = st.sidebar.slider("LSTM Layer 1 Dropout", 0.0, 0.5, 0.2, 0.05, key="wl_lstm_d1")
+elif model_type_input == 'Transformer':
+    manual_params['num_transformer_blocks'] = st.sidebar.slider("Transformer Blocks", 1, 4, 2, key="wl_trans_blocks")
+    manual_params['num_heads'] = st.sidebar.slider("Attention Heads", 1, 8, 4, key="wl_trans_heads")
+    manual_params['ff_dim'] = st.sidebar.slider("Feed Forward Dim", 16, 64, 32, 16, key="wl_trans_ff")
+elif model_type_input == 'Hybrid (LSTM + Transformer)':
+    manual_params['lstm_units'] = st.sidebar.slider("LSTM Units (Hybrid)", 32, 256, 64, 32, key="wl_hy_lstm_u")
+    manual_params['lstm_dropout'] = st.sidebar.slider("LSTM Dropout (Hybrid)", 0.0, 0.5, 0.2, 0.05, key="wl_hy_lstm_d")
+    manual_params['num_transformer_blocks'] = st.sidebar.slider("Transformer Blocks (Hybrid)", 1, 4, 1, key="wl_hy_trans_b")
+    manual_params['num_heads'] = st.sidebar.slider("Attention Heads (Hybrid)", 1, 8, 2, key="wl_hy_trans_h")
+
+# --- Main Prediction Logic for a Single Ticker ---
+def run_prediction_for_ticker(ticker, start_date, end_date, selected_tech, selected_macro, selected_fund, window_size, split_ratio, horizon, model_type, manual_params, epochs, batch_size, learning_rate, num_models):
+    """
+    Runs the full prediction pipeline for a single ticker, including ensembling.
+    """
+    # 1. Fetch and prepare data
+    data = fetch_stock_data(ticker, start_date, end_date)
+    if data.empty: return None, None, f"Data fetching failed for {ticker}."
+    if selected_tech: data = add_technical_indicators(data, selected_tech)
+    if selected_macro: data = add_macro_indicators(data, selected_macro)
+    if selected_fund: data = add_fundamental_indicators(data, ticker, selected_fund)
+    if data.empty: return None, None, f"Data became empty after adding features for {ticker}."
+
+    processed_data, scaler, close_col_index, last_actuals, _ = preprocess_data(data.copy())
+    if processed_data.empty: return None, None, f"Data preprocessing failed for {ticker}."
+
+    target_idx = processed_data.columns.get_loc('Close_scaled')
+    X, y = create_sequences(processed_data.values, target_idx, window_size, horizon)
+    if X.size == 0: return None, None, f"Failed to create sequences for {ticker}."
+
+    test_size = int(len(X) * split_ratio)
+    X_train, X_test, y_train, y_test = X[:-test_size], X[-test_size:], y[:-test_size], y[-test_size:]
+
+    all_future_preds = []
+    all_test_preds = []
     
-    with st.expander("➕ Manage Watchlist", expanded=True):
-        new_ticker = st.text_input("Add Ticker to Watchlist:", key="new_ticker_input").upper()
-        if st.button("Add Ticker") and new_ticker:
-            if new_ticker not in st.session_state.watchlist:
-                st.session_state.watchlist.append(new_ticker)
-                save_watchlist(st.session_state.watchlist)
-                st.success(f"'{new_ticker}' added!")
-                st.rerun()
-            else:
-                st.warning(f"'{new_ticker}' is already in the watchlist.")
+    # 2. Build, Train, and Predict for each model in the ensemble
+    for i in range(num_models):
+        model_builder = {'LSTM': build_lstm_model, 'Transformer': build_transformer_model, 'Hybrid (LSTM + Transformer)': build_hybrid_model}
+        model = model_builder[model_type]((X_train.shape[1], X_train.shape[2]), horizon, manual_params=manual_params, learning_rate=learning_rate)
+        train_model(model, X_train, y_train, epochs, batch_size, learning_rate, X_val=X_test, y_val=y_test)
+        
+        future_p = predict_prices(model, processed_data, scaler, close_col_index, window_size, horizon, last_actuals)
+        all_future_preds.append(future_p)
 
-        if st.session_state.watchlist:
-            ticker_to_remove = st.selectbox("Remove Ticker from Watchlist:", [""] + st.session_state.watchlist)
-            if st.button("Remove Ticker") and ticker_to_remove:
-                st.session_state.watchlist.remove(ticker_to_remove)
-                save_watchlist(st.session_state.watchlist)
-                st.success(f"'{ticker_to_remove}' removed.")
-                st.rerun()
+        test_p_scaled = model.predict(X_test)[:, 0]
+        dummy_pred = np.zeros((len(test_p_scaled), scaler.n_features_in_))
+        dummy_pred[:, close_col_index] = test_p_scaled
+        all_test_preds.append(scaler.inverse_transform(dummy_pred)[:, close_col_index])
 
-    # --- Watchlist Model Settings ---
-    st.subheader("⚙️ Model & Feature Settings")
-    today = date.today()
-    default_end_bt_wl = today - timedelta(days=1)
-    default_start_bt_wl = default_end_bt_wl - timedelta(days=3*365)
+    # 3. Process Ensemble Results
+    if not all_future_preds:
+        return None, None, "All models in the ensemble failed to produce predictions."
 
-    start_date_watchlist = st.date_input("Training Start Date:", value=default_start_bt_wl, key="wl_start_date")
-    end_date_watchlist = st.date_input("Training End Date:", value=default_end_bt_wl, key="wl_end_date")
-
-    if start_date_watchlist >= end_date_watchlist:
-        st.error("Start Date must be before End Date.")
-        st.stop()
-
-    # --- Global & Fundamental Context Selectors ---
-    with st.expander("🌍 Global & 🔬 Fundamental Features"):
-        available_indices_wl = list(config.GLOBAL_MARKET_TICKERS.keys())
-        select_all_globals_wl = st.checkbox("Select All Global Indices", value=False, key="wl_select_all_globals")
-        default_globals_wl = available_indices_wl if select_all_globals_wl else available_indices_wl[:3]
-        selected_indices_wl = st.multiselect("Select Global Indices:", options=available_indices_wl, default=default_globals_wl, key="wl_global_select")
-        selected_tickers_wl = [config.GLOBAL_MARKET_TICKERS[name] for name in selected_indices_wl]
-
-        # Static Fundamentals
-        available_fundamentals_static_wl = list(config.FUNDAMENTAL_METRICS.keys())
-        select_all_fundamentals_static_wl = st.checkbox("Select All Static Fundamentals", value=False, key="wl_select_all_fundamentals_static")
-        default_fundamentals_static_wl = available_fundamentals_static_wl if select_all_fundamentals_static_wl else []
-        selected_fundamental_names_static_wl = st.multiselect("Select Static Fundamental Metrics:", options=available_fundamentals_static_wl, default=default_fundamentals_static_wl, key="wl_static_fundamental_select")
-        selected_fundamentals_static_wl = {name: config.FUNDAMENTAL_METRICS[name] for name in selected_fundamental_names_static_wl}
-
-        # Historical/Derived Fundamentals
-        available_fundamentals_derived_wl = ['Historical P/E Ratio', 'Historical P/S Ratio', 'Historical Debt to Equity']
-        select_all_fundamentals_derived_wl = st.checkbox("Select All Historical/Derived Fundamentals", value=False, key="wl_select_all_fundamentals_derived")
-        default_fundamentals_derived_wl = available_fundamentals_derived_wl if select_all_fundamentals_derived_wl else []
-        selected_fundamental_names_derived_wl = st.multiselect("Select Historical/Derived Metrics:", options=available_fundamentals_derived_wl, default=default_fundamentals_derived_wl, key="wl_derived_fundamental_select")
-        selected_fundamentals_derived_wl = {name: name for name in selected_fundamental_names_derived_wl}
-
-    # Combine all selected fundamental metrics
-    combined_selected_fundamentals_wl = {**selected_fundamentals_static_wl, **selected_fundamentals_derived_wl}
-
-
-    # --- Model Selection ---
-    st.subheader("🤖 Model Selection")
-    models_for_watchlist = st.multiselect(
-        "Select Individual Models to Display:",
-        options=[m for m in config.MODEL_CHOICES if m != 'Prophet'],
-        default=['Random Forest', 'LightGBM']
-    )
+    # Future predictions
+    avg_future_preds = np.mean(all_future_preds, axis=0)
+    std_future_preds = np.std(all_future_preds, axis=0)
+    last_date = data.index[-1]
+    future_dates = pd.bdate_range(start=last_date + timedelta(days=1), periods=horizon)
     
-    # Ensemble Prediction
-    enable_ensemble_wl = st.checkbox("Enable Ensemble Prediction (Recommended)", value=True, key="wl_ensemble")
-    ensemble_models_wl = []
-    if enable_ensemble_wl:
-        ensemble_models_wl = st.multiselect(
-            "Select Models for Ensemble:",
-            [m for m in config.MODEL_CHOICES if m != 'Prophet'],
-            default=['Random Forest', 'LightGBM', 'XGBoost'],
-            key="wl_ensemble_models"
-        )
-
-    # Confidence Intervals
-    enable_confidence_interval_wl = st.checkbox("Enable Confidence Intervals", value=True, key="wl_ci")
-    confidence_level_pct_wl = 90
-    if enable_confidence_interval_wl:
-        confidence_level_pct_wl = st.slider("Confidence Level (%):", 70, 99, 90, 1, key="wl_ci_slider")
-
-    watchlist_perform_tuning = st.checkbox("Perform Hyperparameter Tuning", value=False, key="wl_tuning", help="May significantly slow down processing.")
-
-    # --- Technical Indicator Settings ---
-    st.subheader("📊 Technical Indicator Settings")
-    selected_indicator_params_watchlist = {}
-    with st.expander("Show Indicator Settings"):
-        for indicator_name, (default_value, default_enabled) in config.TECHNICAL_INDICATORS_DEFAULTS.items():
-            if st.checkbox(f"Enable {indicator_name.replace('_', ' ')}", value=default_enabled, key=f"enable_{indicator_name.lower()}_wl"):
-                if isinstance(default_value, list):
-                    selected_indicator_params_watchlist[indicator_name] = parse_int_list(
-                        st.text_input(f"  {indicator_name.replace('_', ' ')} (days):", value=", ".join(map(str, default_value)), key=f"input_{indicator_name.lower()}_wl"),
-                        default_value, st.sidebar.error
-                    )
-                elif isinstance(default_value, (int, float)):
-                    min_val = 0.01 if 'ACCEL' in indicator_name or isinstance(default_value, float) else 1.0
-                    step_val = 0.01 if 'ACCEL' in indicator_name or isinstance(default_value, float) else 1.0
-                    selected_indicator_params_watchlist[indicator_name] = st.number_input(
-                        f"  {indicator_name.replace('_', ' ')}:", min_value=min_val, value=float(default_value), step=step_val, key=f"input_{indicator_name.lower()}_wl"
-                    )
-
-# --- Main Page Content ---
-
-# Helper function to style the dashboard
-def style_dashboard(df):
-    """Applies color coding and formatting to the forecast dashboard."""
-    def color_sentiment(val):
-        color = 'green' if val == 'Bullish' else 'red' if val == 'Bearish' else 'grey'
-        return f'color: {color}; font-weight: bold;'
-
-    return df.style.applymap(color_sentiment, subset=['Sentiment']).format({
-        'Predicted Change %': '{:+.2f}%',
-        'Lower CI %': '{:+.2f}%',
-        'Upper CI %': '{:+.2f}%',
+    results_df = pd.DataFrame({
+        'Date': future_dates,
+        'Ensemble Prediction': avg_future_preds,
+        'Confidence Lower': avg_future_preds - 1.96 * std_future_preds,
+        'Confidence Upper': avg_future_preds + 1.96 * std_future_preds
     })
 
-if not st.session_state.watchlist:
-    st.info("Your watchlist is empty. Please add tickers using the sidebar to get started.")
-elif not models_for_watchlist and not (enable_ensemble_wl and ensemble_models_wl):
-    st.warning("Please select at least one individual model or enable and select models for the ensemble prediction.")
-else:
-    # Placeholders for real-time updates
-    st.subheader("🚀 Forecast Dashboard")
-    dashboard_placeholder = st.empty()
+    # Metrics calculation
+    y_test_first_step = y_test[:, 0]
+    dummy_actual = np.zeros((len(y_test_first_step), scaler.n_features_in_))
+    dummy_actual[:, close_col_index] = y_test_first_step
+    actual_prices = scaler.inverse_transform(dummy_actual)[:, close_col_index]
     
-    st.subheader("Detailed Forecast Results")
-    results_placeholder = st.empty()
+    avg_test_preds = np.mean(all_test_preds, axis=0)
+    rmse, mae, r2 = calculate_metrics(actual_prices, avg_test_preds)
+    metrics = {'RMSE': rmse, 'MAE': mae, 'R2': r2}
+    
+    return results_df, metrics, None
 
-    if st.button("Update Watchlist Forecasts", type="primary"):
-        st.warning("Processing a large watchlist can be time-consuming. Please be patient.")
+# --- UI Display Logic ---
+st.title("📈 My Stock Watchlists")
+st.markdown("Create and manage your stock watchlists. Use the sidebar to configure prediction parameters and run analysis on all tickers in a list.")
+
+tab1, tab_2, tab3 = st.tabs(["Watchlist 1", "Watchlist 2", "Watchlist 3"])
+
+def display_watchlist_tab(tab_name, tab_content):
+    with tab_content:
+        st.header(f"{tab_name}")
         
-        all_results_data = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_ticker = st.text_input("Add Ticker", key=f"add_{tab_name}").upper()
+        with col2:
+            st.write("") 
+            if st.button(f"Add to {tab_name}", use_container_width=True, key=f"add_btn_{tab_name}"):
+                if new_ticker:
+                    st.session_state.watchlists[tab_name].add(new_ticker)
+                    save_watchlists_to_file(st.session_state.watchlists)
+                    st.success(f"Added {new_ticker}!")
+                    st.rerun()
 
-        for idx, ticker_item in enumerate(st.session_state.watchlist):
-            status_text.text(f"Processing {ticker_item} ({idx+1}/{len(st.session_state.watchlist)})...")
+        st.markdown("---")
+        if not st.session_state.watchlists[tab_name]:
+            st.info("This watchlist is empty.")
+        else:
+            for ticker in sorted(list(st.session_state.watchlists[tab_name])):
+                c1, c2 = st.columns([4, 1])
+                c1.subheader(ticker)
+                if c2.button("Remove", key=f"rem_{tab_name}_{ticker}", use_container_width=True):
+                    st.session_state.watchlists[tab_name].remove(ticker)
+                    save_watchlists_to_file(st.session_state.watchlists)
+                    st.rerun()
+        
+        st.markdown("---")
+        if st.button(f"🚀 Run Full Analysis for {tab_name}", use_container_width=True, key=f"run_{tab_name}"):
+            watchlist_tickers = st.session_state.watchlists[tab_name]
+            if not watchlist_tickers:
+                st.warning("Cannot run analysis on an empty watchlist.")
+                return
+
+            st.info(f"Running analysis for {len(watchlist_tickers)} tickers...")
+            progress_bar = st.progress(0)
+            all_results = {}
+
+            for i, ticker in enumerate(watchlist_tickers):
+                with st.spinner(f"Analyzing {ticker}..."):
+                    predictions_df, metrics, error = run_prediction_for_ticker(
+                        ticker, start_date_input, end_date_input, selected_tech_indicators,
+                        selected_macro_indicators, selected_fundamental_indicators,
+                        training_window_size_input, test_set_split_ratio_input,
+                        prediction_horizon_input, model_type_input, manual_params,
+                        epochs, batch_size, learning_rate, num_ensemble_models
+                    )
+                    if error:
+                        st.error(f"Could not analyze {ticker}: {error}")
+                    else:
+                        all_results[ticker] = {'predictions': predictions_df, 'metrics': metrics}
+                progress_bar.progress((i + 1) / len(watchlist_tickers))
             
-            item_data = {'Ticker': ticker_item, 'Status': 'Processing'}
-            df_raw = download_data(ticker_item)
-            if df_raw.empty:
-                item_data['Status'] = "No data"
-                all_results_data.append(item_data)
-                continue
+            if all_results:
+                st.success("Analysis complete!")
+                for ticker, result in all_results.items():
+                    st.subheader(f"🔮 Results for {ticker}")
+                    
+                    if result['metrics']:
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        m_col1.metric("RMSE", f"{result['metrics']['RMSE']:.2f}")
+                        m_col2.metric("MAE", f"{result['metrics']['MAE']:.2f}")
+                        m_col3.metric("R² Score", f"{result['metrics']['R2']:.2f}")
 
-            data_for_features = df_raw.copy()
-            if combined_selected_fundamentals_wl:
-                data_for_features = add_fundamental_features(data_for_features, ticker_item, combined_selected_fundamentals_wl, _update_log_func=(lambda x: None))
-            if selected_tickers_wl:
-                data_for_features = add_market_data_features(data_for_features, "10y", (lambda x: None), selected_tickers=selected_tickers_wl)
+                    df_display = result['predictions'].copy()
+                    df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d')
+                    for col in ['Ensemble Prediction', 'Confidence Lower', 'Confidence Upper']:
+                        df_display[col] = df_display[col].map('${:,.2f}'.format)
+                    
+                    st.dataframe(df_display, use_container_width=True, hide_index=True)
+                    st.markdown("---")
 
-            item_data['Last Close'] = df_raw['Close'].iloc[-1]
-            df_features = create_features(data_for_features, selected_indicator_params_watchlist)
-            
-            if df_features.empty:
-                item_data['Status'] = "Not enough data for features"
-                all_results_data.append(item_data)
-                continue
-
-            last_day_features = df_features.tail(1)
-            df_train_period_watchlist = df_features[(df_features['Date'] >= pd.to_datetime(start_date_watchlist)) & (df_features['Date'] <= pd.to_datetime(end_date_watchlist))].copy()
-
-            if df_train_period_watchlist.empty:
-                item_data['Status'] = "No data in training range"
-                all_results_data.append(item_data)
-                continue
-            
-            # --- Ensemble Prediction Logic ---
-            if enable_ensemble_wl and ensemble_models_wl:
-                ensemble_trained_models = []
-                for ens_model_name in ensemble_models_wl:
-                    trained_ens_model, _ = train_models_pipeline(df_train_period_watchlist.copy(), ens_model_name, watchlist_perform_tuning, (lambda x: None), selected_indicator_params_watchlist)
-                    if trained_ens_model:
-                        ensemble_trained_models.append(trained_ens_model)
-                
-                if ensemble_trained_models:
-                    ens_close, ens_lower, ens_upper = make_ensemble_prediction(ensemble_trained_models, last_day_features.copy(), (lambda x: None), confidence_level_pct_wl if enable_confidence_interval_wl else None)
-                    item_data['Ensemble Close'] = ens_close[0] if isinstance(ens_close, np.ndarray) else ens_close
-                    item_data['Ensemble Lower'] = ens_lower[0] if isinstance(ens_lower, np.ndarray) else ens_lower
-                    item_data['Ensemble Upper'] = ens_upper[0] if isinstance(ens_upper, np.ndarray) else ens_upper
-
-            # --- Individual Model Prediction Logic ---
-            for model_name in models_for_watchlist:
-                trained_models, _ = train_models_pipeline(df_train_period_watchlist.copy(), model_name, watchlist_perform_tuning, (lambda x: None), selected_indicator_params_watchlist)
-                
-                if trained_models:
-                    preds_dict = generate_predictions_pipeline(last_day_features.copy(), trained_models, (lambda x: None), confidence_level_pct_wl if enable_confidence_interval_wl else None)
-                    for target in ['Close', 'Open', 'High', 'Low']:
-                        if target in preds_dict:
-                            item_data[f'{target} ({model_name})'] = preds_dict[target][f'Predicted {target}'].iloc[0]
-                            if pd.notna(preds_dict[target][f'Predicted {target} Lower'].iloc[0]):
-                                item_data[f'{target} Lower ({model_name})'] = preds_dict[target][f'Predicted {target} Lower'].iloc[0]
-                            if pd.notna(preds_dict[target][f'Predicted {target} Upper'].iloc[0]):
-                                item_data[f'{target} Upper ({model_name})'] = preds_dict[target][f'Predicted {target} Upper'].iloc[0]
-
-            item_data['Status'] = 'OK'
-            all_results_data.append(item_data)
-            
-            # --- UPDATE DASHBOARD AND TABLES IN REAL-TIME ---
-            # 1. Create the detailed results dataframe
-            detailed_df = pd.DataFrame(all_results_data)
-            
-            # 2. Create and populate the dashboard dataframe
-            dashboard_data = []
-            primary_model_col = 'Ensemble Close' if (enable_ensemble_wl and 'Ensemble Close' in detailed_df.columns) else f'Close ({models_for_watchlist[0]})' if models_for_watchlist else None
-            
-            if primary_model_col and primary_model_col in detailed_df.columns:
-                for _, row in detailed_df.iterrows():
-                    if row['Status'] == 'OK':
-                        pred_change = ((row[primary_model_col] - row['Last Close']) / row['Last Close']) * 100
-                        
-                        lower_ci_pct, upper_ci_pct = np.nan, np.nan
-                        lower_col = 'Ensemble Lower' if 'Ensemble Lower' in row else f'{primary_model_col.split(" ")[0]} Lower ({primary_model_col.split(" ")[1][1:-1]})'
-                        upper_col = 'Ensemble Upper' if 'Ensemble Upper' in row else f'{primary_model_col.split(" ")[0]} Upper ({primary_model_col.split(" ")[1][1:-1]})'
-
-                        if enable_confidence_interval_wl and lower_col in row and pd.notna(row[lower_col]):
-                            lower_ci_pct = ((row[lower_col] - row['Last Close']) / row['Last Close']) * 100
-                        if enable_confidence_interval_wl and upper_col in row and pd.notna(row[upper_col]):
-                             upper_ci_pct = ((row[upper_col] - row['Last Close']) / row['Last Close']) * 100
-
-                        dashboard_data.append({
-                            'Ticker': row['Ticker'],
-                            'Sentiment': 'Bullish' if pred_change > 0 else 'Bearish',
-                            'Predicted Change %': pred_change,
-                            'Lower CI %': lower_ci_pct,
-                            'Upper CI %': upper_ci_pct
-                        })
-            
-            dashboard_df = pd.DataFrame(dashboard_data)
-            
-            # 3. Update placeholders
-            if not dashboard_df.empty:
-                dashboard_placeholder.dataframe(style_dashboard(dashboard_df[['Ticker', 'Sentiment', 'Predicted Change %', 'Lower CI %', 'Upper CI %']]), use_container_width=True, hide_index=True)
-
-            results_placeholder.dataframe(detailed_df, use_container_width=True, hide_index=True)
-            progress_bar.progress((idx + 1) / len(st.session_state.watchlist))
-
-        progress_bar.empty()
-        status_text.empty()
+# --- Render Tabs ---
+display_watchlist_tab("Watchlist 1", tab1)
+display_watchlist_tab("Watchlist 2", tab_2)
+display_watchlist_tab("Watchlist 3", tab3)

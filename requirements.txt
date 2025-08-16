@@ -2,10 +2,12 @@ streamlit
 pandas
 numpy
 yfinance
-plotly
+tensorflow
 scikit-learn
-xgboost
-lightgbm
+plotly
+ta
 prophet
 catboost
-scipy
+requests
+tqdm
+keras-tuner
