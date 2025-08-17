@@ -88,13 +88,10 @@ def build_transformer_model(input_shape: tuple, output_dim: int, hp=None, manual
     num_blocks = params.get('num_transformer_blocks', 2)
     num_heads = params.get('num_heads', 4)
     ff_dim = params.get('ff_dim', 32)
-    # --- ARCHITECTURE FIX: Add a configurable embedding dimension ---
-    embed_dim = params.get('embed_dim', 64) # Default to 64
+    embed_dim = input_shape[1] # Number of features
 
     inputs = Input(shape=input_shape)
-    # --- ARCHITECTURE FIX: Project input features into the learned embedding space ---
-    x = TimeDistributed(Dense(embed_dim))(inputs)
-    
+    x = inputs
     for _ in range(num_blocks):
         x = TransformerBlock(embed_dim, num_heads, ff_dim)(x)
     
@@ -213,7 +210,6 @@ if KERAS_TUNER_AVAILABLE:
                 manual_params[f'dropout_{i+1}'] = hp.Float(f'dropout_{i+1}', 0.1, 0.5, step=0.1)
             model = build_lstm_model(input_shape, output_dim, manual_params=manual_params, learning_rate=learning_rate)
         elif model_type == 'Transformer':
-            manual_params['embed_dim'] = hp.Int('embed_dim', 32, 128, step=32) # Tunable embed_dim
             manual_params['num_transformer_blocks'] = hp.Int('num_transformer_blocks', 1, 3)
             manual_params['num_heads'] = hp.Int('num_heads', 2, 8, step=2)
             manual_params['ff_dim'] = hp.Int('ff_dim', 32, 128, step=32)
@@ -237,9 +233,7 @@ if KERAS_TUNER_AVAILABLE:
 
         if not force_retune and os.path.exists(tuner_dir):
             display_log("✅ Found existing tuner results. Loading best model.", "info")
-            # --- FIX: Unpack the 3 return values and return 4, adding None for the summary ---
-            best_model, best_hps, tuner_params = load_best_tuner_model(model_type, input_shape, output_dim, best_models_dir)
-            return best_model, best_hps, tuner_params, None
+            return load_best_tuner_model(model_type, input_shape, output_dim, best_models_dir)
 
         display_log(f"튜닝을 시작합니다: {model_type}...", "info")
         
@@ -260,10 +254,10 @@ if KERAS_TUNER_AVAILABLE:
         best_model = tuner.get_best_models(num_models=1)[0]
         
         learning_rate = best_hps.get('learning_rate')
-        # Batch size is a training param, not a hyperparameter in this setup, so it's not retrieved from the tuner.
-        
+        batch_size = best_hps.get('batch_size')
+
         display_log("✅ Hyperparameter tuning complete.", "info")
-        return best_model, best_hps, {'learning_rate': learning_rate}, tuner.results_summary()
+        return best_model, best_hps, {'learning_rate': learning_rate, 'batch_size': batch_size}, tuner.results_summary()
 
     def load_best_tuner_model(model_type: str, input_shape: tuple, output_dim: int, best_models_dir: str):
         """Loads the best model from a completed Keras Tuner run."""
@@ -280,11 +274,10 @@ if KERAS_TUNER_AVAILABLE:
             best_model = tuner.get_best_models(num_models=1)[0]
             best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
             learning_rate = best_hps.get('learning_rate')
-            # --- FIX: Removed the problematic line trying to get 'batch_size' ---
+            batch_size = best_hps.get('batch_size')
             
             display_log("✅ Best model and HPs loaded from tuner directory.", "info")
-            # --- FIX: Return only the learning rate in the params dict ---
-            return best_model, best_hps, {'learning_rate': learning_rate}
+            return best_model, best_hps, {'learning_rate': learning_rate, 'batch_size': batch_size}
         except Exception as e:
             display_log(f"❌ Could not load from tuner directory: {e}. A retune might be needed.", "error")
             return None, None, {}

@@ -10,15 +10,6 @@ warnings.filterwarnings("ignore")
 # --- Page Configuration ---
 st.set_page_config(layout="wide", page_title="Global Market Dashboard")
 
-# --- Hide Streamlit Menu & Footer ---
-st.markdown("""
-    <style>
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header {visibility: hidden;}
-    </style>
-""", unsafe_allow_html=True)
-
 # --- Data Configuration ---
 SYMBOLS = {
     'Stock Indices': {

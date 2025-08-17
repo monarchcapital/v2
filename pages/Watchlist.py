@@ -7,27 +7,15 @@ from datetime import date, timedelta
 import warnings
 import os
 import json
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
 
-# --- IMPROVEMENT: Import the centralized pipeline ---
-from pipeline import run_prediction_pipeline
+# --- Import Core Functions from other modules ---
+from data import fetch_stock_data, add_technical_indicators, add_macro_indicators, add_fundamental_indicators
+from utils import preprocess_data, create_sequences, calculate_metrics
+from model import build_lstm_model, build_transformer_model, build_hybrid_model, train_model, predict_prices
 
 # Suppress warnings to keep the UI clean
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
-
-# --- Page Configuration ---
-st.set_page_config(page_title="Stock Watchlists", page_icon="📈", layout="wide")
-
-# --- Hide Streamlit Menu & Footer ---
-st.markdown("""
-    <style>
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header {visibility: hidden;}
-    </style>
-""", unsafe_allow_html=True)
 
 # --- File-Based Persistence Functions ---
 WATCHLIST_FILE = "watchlists.txt"
@@ -54,13 +42,8 @@ def save_watchlists_to_file(watchlists):
     except IOError as e:
         st.error(f"Error saving watchlists to file: {e}")
 
-# --- API Key Configuration ---
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=GOOGLE_API_KEY)
-except (KeyError, FileNotFoundError):
-    st.sidebar.warning("Google AI API Key not found. News analysis will be disabled.", icon="⚠️")
-    GOOGLE_API_KEY = None
+# --- Page Configuration ---
+st.set_page_config(page_title="Stock Watchlists", page_icon="📈", layout="wide")
 
 # --- Initialize Session State ---
 if 'watchlists' not in st.session_state:
@@ -88,27 +71,24 @@ selected_macro_indicators = st.sidebar.multiselect("Macroeconomic Indicators", a
 all_fundamental_indicators = ['Total Revenue', 'Net Income', 'EBITDA', 'Total Assets', 'Total Liabilities', 'Operating Cash Flow', 'Capital Expenditure']
 selected_fundamental_indicators = st.sidebar.multiselect("Fundamental Indicators", all_fundamental_indicators, default=[], key="wl_fundamental")
 
-st.sidebar.subheader("Ensemble Mode")
+st.sidebar.subheader("Hyperparameter & Ensemble Mode")
 use_ensemble = st.sidebar.checkbox("Use Ensemble of Models", value=True, key="wl_ensemble")
 if use_ensemble:
     num_ensemble_models = st.sidebar.slider("Ensemble Size", 2, 10, 5, key="wl_ensemble_size")
 else:
     num_ensemble_models = 1
 
-# For watchlists, we'll stick to manual mode for simplicity and speed.
-# Advanced tuning can be done on the main ML Prediction page.
+manual_params = {}
 st.sidebar.subheader("Manual Hyperparameters")
 epochs = st.sidebar.number_input("Epochs (Manual)", 1, 100, 30, key="wl_epochs")
 batch_size = st.sidebar.number_input("Batch Size (Manual)", 1, 256, 32, key="wl_batch_size")
 learning_rate = st.sidebar.number_input("Learning Rate (Manual)", 0.0001, 0.1, 0.001, format="%.4f", key="wl_lr")
 
-manual_params = {}
 if model_type_input == 'LSTM':
     manual_params['num_lstm_layers'] = st.sidebar.slider("LSTM Layers", 1, 3, 2, key="wl_lstm_layers")
     manual_params['lstm_units_1'] = st.sidebar.slider("LSTM Layer 1 Units", 32, 256, 100, 32, key="wl_lstm_u1")
     manual_params['dropout_1'] = st.sidebar.slider("LSTM Layer 1 Dropout", 0.0, 0.5, 0.2, 0.05, key="wl_lstm_d1")
 elif model_type_input == 'Transformer':
-    manual_params['embed_dim'] = st.sidebar.slider("Embedding Dim", 32, 128, 64, 16, key="wl_trans_embed")
     manual_params['num_transformer_blocks'] = st.sidebar.slider("Transformer Blocks", 1, 4, 2, key="wl_trans_blocks")
     manual_params['num_heads'] = st.sidebar.slider("Attention Heads", 1, 8, 4, key="wl_trans_heads")
     manual_params['ff_dim'] = st.sidebar.slider("Feed Forward Dim", 16, 64, 32, 16, key="wl_trans_ff")
@@ -118,12 +98,85 @@ elif model_type_input == 'Hybrid (LSTM + Transformer)':
     manual_params['num_transformer_blocks'] = st.sidebar.slider("Transformer Blocks (Hybrid)", 1, 4, 1, key="wl_hy_trans_b")
     manual_params['num_heads'] = st.sidebar.slider("Attention Heads (Hybrid)", 1, 8, 2, key="wl_hy_trans_h")
 
+# --- Main Prediction Logic for a Single Ticker ---
+def run_prediction_for_ticker(ticker, start_date, end_date, selected_tech, selected_macro, selected_fund, window_size, split_ratio, horizon, model_type, manual_params, epochs, batch_size, learning_rate, num_models):
+    """
+    Runs the full prediction pipeline for a single ticker, including ensembling.
+    """
+    # 1. Fetch and prepare data
+    data = fetch_stock_data(ticker, start_date, end_date)
+    if data.empty: return None, None, f"Data fetching failed for {ticker}."
+    if selected_tech: data = add_technical_indicators(data, selected_tech)
+    if selected_macro: data = add_macro_indicators(data, selected_macro)
+    if selected_fund: data = add_fundamental_indicators(data, ticker, selected_fund)
+    if data.empty: return None, None, f"Data became empty after adding features for {ticker}."
+
+    processed_data, scaler, close_col_index, last_actuals, _ = preprocess_data(data.copy())
+    if processed_data.empty: return None, None, f"Data preprocessing failed for {ticker}."
+
+    target_idx = processed_data.columns.get_loc('Close_scaled')
+    X, y = create_sequences(processed_data.values, target_idx, window_size, horizon)
+    if X.size == 0: return None, None, f"Failed to create sequences for {ticker}."
+
+    test_size = int(len(X) * split_ratio)
+    X_train, X_test, y_train, y_test = X[:-test_size], X[-test_size:], y[:-test_size], y[-test_size:]
+
+    all_future_preds = []
+    all_test_preds = []
+    
+    # 2. Build, Train, and Predict for each model in the ensemble
+    for i in range(num_models):
+        model_builder = {'LSTM': build_lstm_model, 'Transformer': build_transformer_model, 'Hybrid (LSTM + Transformer)': build_hybrid_model}
+        model = model_builder[model_type](
+            (X_train.shape[1], X_train.shape[2]),
+            horizon,
+            manual_params=manual_params,
+            learning_rate=learning_rate  # FIX: Pass learning_rate to model builder
+        )
+        train_model(model, X_train, y_train, epochs, batch_size, learning_rate, X_val=X_test, y_val=y_test)
+        
+        future_p = predict_prices(model, processed_data, scaler, close_col_index, window_size, horizon, last_actuals)
+        all_future_preds.append(future_p)
+
+        test_p_scaled = model.predict(X_test)[:, 0]
+        dummy_pred = np.zeros((len(test_p_scaled), scaler.n_features_in_))
+        dummy_pred[:, close_col_index] = test_p_scaled
+        all_test_preds.append(scaler.inverse_transform(dummy_pred)[:, close_col_index])
+
+    # 3. Process Ensemble Results
+    if not all_future_preds:
+        return None, None, "All models in the ensemble failed to produce predictions."
+
+    # Future predictions
+    avg_future_preds = np.mean(all_future_preds, axis=0)
+    std_future_preds = np.std(all_future_preds, axis=0)
+    last_date = data.index[-1]
+    future_dates = pd.bdate_range(start=last_date + timedelta(days=1), periods=horizon)
+    
+    results_df = pd.DataFrame({
+        'Date': future_dates,
+        'Ensemble Prediction': avg_future_preds,
+        'Confidence Lower': avg_future_preds - 1.96 * std_future_preds,
+        'Confidence Upper': avg_future_preds + 1.96 * std_future_preds
+    })
+
+    # Metrics calculation
+    y_test_first_step = y_test[:, 0]
+    dummy_actual = np.zeros((len(y_test_first_step), scaler.n_features_in_))
+    dummy_actual[:, close_col_index] = y_test_first_step
+    actual_prices = scaler.inverse_transform(dummy_actual)[:, close_col_index]
+    
+    avg_test_preds = np.mean(all_test_preds, axis=0)
+    rmse, mae, r2 = calculate_metrics(actual_prices, avg_test_preds)
+    metrics = {'RMSE': rmse, 'MAE': mae, 'R2': r2}
+    
+    return results_df, metrics, None
 
 # --- UI Display Logic ---
 st.title("📈 My Stock Watchlists")
 st.markdown("Create and manage your stock watchlists. Use the sidebar to configure prediction parameters and run analysis on all tickers in a list.")
 
-tab1, tab2, tab3 = st.tabs(["Watchlist 1", "Watchlist 2", "Watchlist 3"])
+tab1, tab_2, tab3 = st.tabs(["Watchlist 1", "Watchlist 2", "Watchlist 3"])
 
 def display_watchlist_tab(tab_name, tab_content):
     with tab_content:
@@ -145,19 +198,13 @@ def display_watchlist_tab(tab_name, tab_content):
         if not st.session_state.watchlists[tab_name]:
             st.info("This watchlist is empty.")
         else:
-            sorted_tickers = sorted(list(st.session_state.watchlists[tab_name]))
-            for i in range(0, len(sorted_tickers), 4):
-                cols = st.columns(4)
-                for j in range(4):
-                    if i + j < len(sorted_tickers):
-                        ticker = sorted_tickers[i+j]
-                        with cols[j]:
-                            with st.container(border=True):
-                                st.subheader(ticker)
-                                if st.button("Remove", key=f"rem_{tab_name}_{ticker}", use_container_width=True):
-                                    st.session_state.watchlists[tab_name].remove(ticker)
-                                    save_watchlists_to_file(st.session_state.watchlists)
-                                    st.rerun()
+            for ticker in sorted(list(st.session_state.watchlists[tab_name])):
+                c1, c2 = st.columns([4, 1])
+                c1.subheader(ticker)
+                if c2.button("Remove", key=f"rem_{tab_name}_{ticker}", use_container_width=True):
+                    st.session_state.watchlists[tab_name].remove(ticker)
+                    save_watchlists_to_file(st.session_state.watchlists)
+                    st.rerun()
         
         st.markdown("---")
         if st.button(f"🚀 Run Full Analysis for {tab_name}", use_container_width=True, key=f"run_{tab_name}"):
@@ -167,60 +214,45 @@ def display_watchlist_tab(tab_name, tab_content):
                 return
 
             st.info(f"Running analysis for {len(watchlist_tickers)} tickers...")
-            progress_bar = st.progress(0, text="Initializing...")
+            progress_bar = st.progress(0)
             all_results = {}
 
             for i, ticker in enumerate(watchlist_tickers):
-                progress_bar.progress((i + 1) / len(watchlist_tickers), text=f"Analyzing {ticker}...")
-                
-                # --- IMPROVEMENT: Call the centralized pipeline ---
-                results = run_prediction_pipeline(
-                    ticker, start_date_input, end_date_input, selected_tech_indicators,
-                    selected_macro_indicators, selected_fundamental_indicators,
-                    apply_differencing=False, enable_pca=False, n_components_manual=0, # Simplified for watchlist
-                    training_window_size=training_window_size_input,
-                    test_set_split_ratio=test_set_split_ratio_input,
-                    prediction_horizon=prediction_horizon_input,
-                    model_type=model_type_input,
-                    hp_mode="Manual", # Always manual for watchlist
-                    force_retune=False, epochs=epochs, num_trials=0, executions_per_trial=0,
-                    manual_params=manual_params, batch_size=batch_size, learning_rate=learning_rate,
-                    num_ensemble_models=num_ensemble_models
-                )
-
-                if 'error' in results:
-                    st.error(f"Could not analyze {ticker}: {results['error']}")
-                else:
-                    all_results[ticker] = results
-            
-            st.session_state[f'results_{tab_name}'] = all_results
-            progress_bar.empty()
-
-        if f'results_{tab_name}' in st.session_state:
-            st.success("Analysis complete!")
-            for ticker, result in st.session_state[f'results_{tab_name}'].items():
-                st.subheader(f"🔮 Results for {ticker}")
-                
-                res_col1, res_col2 = st.columns([1,1])
-                with res_col1:
-                    st.markdown("**Future Price Predictions**")
-                    if result['future_predicted_prices'] is not None:
-                        predictions_df = result['future_predicted_prices'].reset_index()
-                        predictions_df.columns = ['Date', 'Prediction']
-                        predictions_df['Date'] = predictions_df['Date'].dt.strftime('%Y-%m-%d')
-                        predictions_df['Prediction'] = predictions_df['Prediction'].map('${:,.2f}'.format)
-                        st.dataframe(predictions_df, use_container_width=True, hide_index=True)
+                with st.spinner(f"Analyzing {ticker}..."):
+                    predictions_df, metrics, error = run_prediction_for_ticker(
+                        ticker, start_date_input, end_date_input, selected_tech_indicators,
+                        selected_macro_indicators, selected_fundamental_indicators,
+                        training_window_size_input, test_set_split_ratio_input,
+                        prediction_horizon_input, model_type_input, manual_params,
+                        epochs, batch_size, learning_rate, num_ensemble_models
+                    )
+                    if error:
+                        st.error(f"Could not analyze {ticker}: {error}")
                     else:
-                        st.warning("No future predictions were generated.")
+                        all_results[ticker] = {'predictions': predictions_df, 'metrics': metrics}
+                progress_bar.progress((i + 1) / len(watchlist_tickers))
+            
+            if all_results:
+                st.success("Analysis complete!")
+                for ticker, result in all_results.items():
+                    st.subheader(f"🔮 Results for {ticker}")
+                    
+                    if result['metrics']:
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        m_col1.metric("RMSE", f"{result['metrics']['RMSE']:.2f}")
+                        m_col2.metric("MAE", f"{result['metrics']['MAE']:.2f}")
+                        m_col3.metric("R² Score", f"{result['metrics']['R2']:.2f}")
 
-                with res_col2:
-                    st.markdown("**AI News Summary**")
-                    with st.container(height=300):
-                         st.markdown(result['news_summary'])
-
-                st.markdown("---")
+                    df_display = result['predictions'].copy()
+                    # FIX: Drop unvisualized confidence columns for a cleaner table
+                    df_display = df_display.drop(columns=['Confidence Lower', 'Confidence Upper'])
+                    df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d')
+                    df_display['Ensemble Prediction'] = df_display['Ensemble Prediction'].map('${:,.2f}'.format)
+                    
+                    st.dataframe(df_display, use_container_width=True, hide_index=True)
+                    st.markdown("---")
 
 # --- Render Tabs ---
 display_watchlist_tab("Watchlist 1", tab1)
-display_watchlist_tab("Watchlist 2", tab2)
+display_watchlist_tab("Watchlist 2", tab_2)
 display_watchlist_tab("Watchlist 3", tab3)
