@@ -1,1 +1,0 @@
-{"Watchlist 1": ["RELIANCE.NS", "HUDCO.NS"], "Watchlist 2": [], "Watchlist 3": []}
